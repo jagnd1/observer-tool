@@ -33,13 +33,25 @@ export const QDEFS = [
   },
 ]
 
+function topLabel(i, n) {
+  if (i === 0)     return 'one WHY/systemic level above core'
+  if (i === n - 1) return 'most abstract/meta/universal level'
+  return 'abstraction level ' + (i + 1)
+}
+
+function botLabel(i, m) {
+  if (i === 0)     return 'one HOW/mechanical level below core'
+  if (i === m - 1) return 'most granular/atomic root'
+  return 'detail level ' + (i + 1)
+}
+
 export function buildPrompt(q, n, m, p) {
   const topTpl = Array.from({ length: n }, (_, i) =>
-    `"<${i === 0 ? 'one WHY/systemic level above core' : i === n - 1 ? 'most abstract/meta/universal level' : `abstraction level ${i + 1}`}>"`
+    `"<${topLabel(i, n)}>"`
   ).join(', ')
 
   const botTpl = Array.from({ length: m }, (_, i) =>
-    `"<${i === 0 ? 'one HOW/mechanical level below core' : i === m - 1 ? 'most granular/atomic root' : `detail level ${i + 1}`}>"`
+    `"<${botLabel(i, m)}>"`
   ).join(', ')
 
   const sideTpl = Array.from({ length: p }, (_, i) =>
@@ -73,4 +85,66 @@ export function parseResponse(text) {
   const match = text.match(/\{[\s\S]*\}/)
   if (!match) return null
   try { return JSON.parse(match[0]) } catch { return null }
+}
+
+// ─── Refinement user content ──────────────────────────────────────────────────
+
+/**
+ * Builds the userContent string for a refinement API call.
+ * feedback: { [nodeKey]: 'accept'|'correct' }
+ * comments: { [nodeKey]: string }
+ * Node key convention:
+ *   'core'          → previousOutput.core
+ *   'top_k' (k≥1)  → previousOutput.top[k-1]   (top_1 = ↑1 = closest to core)
+ *   'bot_k' (k≥1)  → previousOutput.bottom[k-1]
+ *   'side_k' (k≥1) → previousOutput.sides[k-1]
+ */
+export function buildRefinementUserContent(previousOutput, feedback, comments, problem, solution) {
+  const n = (previousOutput.top    || []).length
+  const m = (previousOutput.bottom || []).length
+  const p = (previousOutput.sides  || []).length
+
+  const nodeVal = (key) => {
+    if (key === 'core') return previousOutput.core || ''
+    const t = key.match(/^top_(\d+)$/)
+    if (t) return (previousOutput.top    || [])[+t[1] - 1] || ''
+    const b = key.match(/^bot_(\d+)$/)
+    if (b) return (previousOutput.bottom || [])[+b[1] - 1] || ''
+    const s = key.match(/^side_(\d+)$/)
+    if (s) return (previousOutput.sides  || [])[+s[1] - 1] || ''
+    return ''
+  }
+
+  const keys = [
+    'core',
+    ...Array.from({ length: n }, (_, i) => `top_${i + 1}`),
+    ...Array.from({ length: m }, (_, i) => `bot_${i + 1}`),
+    ...Array.from({ length: p }, (_, i) => `side_${i + 1}`),
+  ]
+
+  const feedbackLines = keys
+    .filter(k => feedback[k])
+    .map(k => {
+      const val     = nodeVal(k)
+      const comment = comments[k] ? ` — "${comments[k]}"` : ''
+      if (feedback[k] === 'accept')  return `- ${k} ("${val}"): ACCEPTED`
+      if (feedback[k] === 'correct') return `- ${k} ("${val}"): CORRECT${comment}`
+      return null
+    })
+    .filter(Boolean)
+    .join('\n')
+
+  return `PROBLEM:\n${problem}\n\nPROPOSED SOLUTION:\n${solution}
+
+PREVIOUS ANALYSIS:
+${JSON.stringify(previousOutput, null, 2)}
+
+USER FEEDBACK:
+${feedbackLines || '(no specific feedback — refine for sharpness)'}
+
+INSTRUCTIONS:
+- ACCEPTED nodes: the insight is correct — keep wording; may refine subtly
+- CORRECT nodes: user disagrees — integrate their direction, substantially rewrite
+- Uncorrected nodes: sharpen if possible
+- Return the same JSON structure. Max 20 words per item. No hedging. No preamble.`
 }
