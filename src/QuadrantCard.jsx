@@ -62,7 +62,7 @@ function ExpandDot({ accent }) {
 
 // ─── Feedback row (shared by all node types) ─────────────────────────────────
 
-function FeedbackRow({ nodeKey, fbStatus, fbComment, accent, onAccept, onStartCorrect }) {
+function FeedbackRow({ fbStatus, fbComment, accent, onAccept, onStartCorrect }) {
   if (fbStatus === 'accept') {
     return <span style={{ fontSize: 8, color: '#22c55e', opacity: 0.7, marginTop: 2 }}>✓</span>
   }
@@ -167,7 +167,6 @@ function AxisNode({
       {/* feedback affordances */}
       {visible && !correcting && (
         <FeedbackRow
-          nodeKey={nodeKey}
           fbStatus={fbStatus}
           fbComment={fbComment}
           accent={accent}
@@ -241,7 +240,6 @@ function LateralNode({ text, sideNum, x, y, shown, accent, nodeKey, fbStatus, fb
       {text}
       {!correcting && (
         <FeedbackRow
-          nodeKey={nodeKey}
           fbStatus={fbStatus}
           fbComment={fbComment}
           accent={accent}
@@ -381,6 +379,8 @@ export default function QuadrantCard({
   const [topShown,      setTopShown]      = useState(0)
   const [botShown,      setBotShown]      = useState(0)
   const [lateralsShown, setLateralsShown] = useState(false)
+  const [coreCorrecting, setCoreCorrecting] = useState(false)
+  const [coreText,       setCoreText]       = useState('')
 
   // Reset expansion only on fresh analyze (resetKey change), NOT on refinement
   useEffect(() => {
@@ -441,7 +441,7 @@ export default function QuadrantCard({
 
   // ── Visible keys (for footer logic) ──────────────────────────────────────
   const visibleKeys = data && !data.error ? [
-    'core',
+    ...(coreNotExpanded ? [] : ['core']),
     ...Array.from({ length: topShown },      (_, i) => `top_${i + 1}`),
     ...Array.from({ length: botShown },      (_, i) => `bot_${i + 1}`),
     ...(lateralsShown ? sideArr.map((_, i) => `side_${i + 1}`) : []),
@@ -553,15 +553,37 @@ export default function QuadrantCard({
             return (
               <div style={{ ...coreStyle, cursor: 'default' }}>
                 {data.core}
-                <FeedbackRow
-                  nodeKey="core"
-                  fbStatus={feedback['core']}
-                  fbComment={comments['core']}
-                  hovered={false}
-                  accent={accent}
-                  onAccept={() => onFeedback('core', 'accept')}
-                  onStartCorrect={() => onFeedback('core', 'correct', '')}
-                />
+                {!coreCorrecting && (
+                  <FeedbackRow
+                    fbStatus={feedback['core']}
+                    fbComment={comments['core']}
+                    accent={accent}
+                    onAccept={() => onFeedback('core', 'accept')}
+                    onStartCorrect={() => setCoreCorrecting(true)}
+                  />
+                )}
+                {coreCorrecting && (
+                  <input
+                    autoFocus
+                    value={coreText}
+                    onChange={(e) => setCoreText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        const t = coreText.trim()
+                        if (t) { onFeedback('core', 'correct', t); setCoreCorrecting(false); setCoreText('') }
+                      }
+                      if (e.key === 'Escape') { setCoreCorrecting(false); setCoreText('') }
+                    }}
+                    placeholder="correct this…"
+                    style={{
+                      fontSize: 9, width: '100%', marginTop: 3,
+                      padding: '2px 5px', borderRadius: 3,
+                      border: `0.5px solid ${accent}50`,
+                      background: `${accent}0a`,
+                      color: 'var(--color-text-primary)', outline: 'none',
+                    }}
+                  />
+                )}
               </div>
             )
           })()}
