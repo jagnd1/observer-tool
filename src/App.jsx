@@ -1,8 +1,17 @@
-import React, { useState } from 'react'
+import React, { useState, useRef, useEffect } from 'react'
 import QuadrantCard from './QuadrantCard.jsx'
 import DepthControls from './DepthControls.jsx'
 import { QDEFS, buildPrompt, buildRefinementUserContent, parseResponse } from './quadrants.js'
 import { callClaude } from './api.js'
+
+// ─── Token estimation ─────────────────────────────────────────────────────────
+// Rough estimate: 4 chars per token for English text. Include system + user content.
+
+function estimatePromptTokens(system, userContent) {
+  const approxTokens = (system.length + userContent.length) / 4
+  // Max context for claude-sonnet-4-20250514 is 200k tokens; leave headroom
+  return Math.ceil(approxTokens)
+}
 
 // ─── Convergence bar ──────────────────────────────────────────────────────────
 
@@ -62,6 +71,10 @@ export default function App() {
   const [n, setN] = useState(2)
   const [m, setM] = useState(2)
   const [p, setP] = useState(2)
+  const [theme, setTheme] = useState(() => {
+    const saved = localStorage.getItem('observer-theme')
+    return saved === 'light' || saved === 'dark' ? saved : null
+  })
 
   // Iteration history per quadrant: { qId: ParsedResponse[] }
   const [iterations,    setIterations]    = useState({})
@@ -78,6 +91,95 @@ export default function App() {
 
   const [loading, setLoading] = useState(false)
   const [error,   setError]   = useState('')
+  const [tokenWarning, setTokenWarning] = useState('')
+  const [showApiKeyInput, setShowApiKeyInput] = useState(false)
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [mockMode, setMockMode] = useState(() => {
+    const saved = localStorage.getItem('openrouter-mock')
+    return saved === 'true' || saved === null ? true : saved === 'true'
+  })
+
+  // Track abort controllers for in-flight requests
+  const abortControllersRef = useRef({})
+
+  // Load session from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('observer-session')
+      if (saved) {
+        const data = JSON.parse(saved)
+        setProblem(data.problem || '')
+        setSolution(data.solution || '')
+        setN(data.n ?? 2)
+        setM(data.m ?? 2)
+        setP(data.p ?? 2)
+        setIterations(data.iterations || {})
+        setNodeFeedback(data.nodeFeedback || {})
+        setNodeComments(data.nodeComments || {})
+        setConvergedQ(data.convergedQ || {})
+        setResetKeys(data.resetKeys || {})
+      }
+      // Load API key if present
+      const savedKey = localStorage.getItem('openrouter-api-key')
+      if (savedKey) {
+        setApiKeyInput(savedKey)
+      }
+    } catch (e) {
+      console.warn('Failed to load session from localStorage:', e)
+    }
+  }, [])
+
+  // Persist session to localStorage on relevant state changes
+  useEffect(() => {
+    try {
+      const session = {
+        problem,
+        solution,
+        n,
+        m,
+        p,
+        iterations,
+        nodeFeedback,
+        nodeComments,
+        convergedQ,
+        resetKeys,
+      }
+      localStorage.setItem('observer-session', JSON.stringify(session))
+    } catch (e) {
+      console.warn('Failed to save session to localStorage:', e)
+    }
+  }, [problem, solution, n, m, p, iterations, nodeFeedback, nodeComments, convergedQ, resetKeys])
+
+  // Theme management
+  useEffect(() => {
+    if (theme === 'light') {
+      document.documentElement.setAttribute('data-theme', 'light')
+    } else if (theme === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark')
+    } else {
+      document.documentElement.removeAttribute('data-theme')
+    }
+    localStorage.setItem('observer-theme', theme || 'system')
+  }, [theme])
+
+  // API key persistence
+  useEffect(() => {
+    if (apiKeyInput) {
+      localStorage.setItem('openrouter-api-key', apiKeyInput)
+    }
+  }, [apiKeyInput])
+
+  // Mock mode persistence
+  useEffect(() => {
+    localStorage.setItem('openrouter-mock', mockMode)
+  }, [mockMode])
+
+  // Cleanup: abort any in-flight requests on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(abortControllersRef.current).forEach(ac => ac.abort())
+    }
+  }, [])
 
   // ── Fresh analysis ───────────────────────────────────────────────────────
 
@@ -86,6 +188,27 @@ export default function App() {
       setError('Both fields are required.')
       return
     }
+
+    // Check token budget before proceeding
+    const userContent = `PROBLEM:\n${problem.trim()}\n\nPROPOSED SOLUTION:\n${solution.trim()}`
+    let estimatedTokens = 0
+    QDEFS.forEach(q => {
+      const system = buildPrompt(q, n, m, p)
+      estimatedTokens = Math.max(estimatedTokens, estimatePromptTokens(system, userContent))
+    })
+
+    // Warn if approaching limit (150k tokens leaves headroom)
+    if (estimatedTokens > 150000) {
+      setTokenWarning(`Input may be too long for depth ${n}×${m}×${p}. Estimated: ~${estimatedTokens.toLocaleString()} tokens. Consider reducing depth.`)
+      // Still proceed - don't block
+    } else {
+      setTokenWarning('')
+    }
+
+    // Cancel any in-flight requests
+    Object.values(abortControllersRef.current).forEach(ac => ac.abort())
+    abortControllersRef.current = {}
+
     setError('')
     setIterations({})
     setNodeFeedback({})
@@ -97,22 +220,35 @@ export default function App() {
     )
     setLoading(true)
 
-    const ctx = `PROBLEM:\n${problem.trim()}\n\nPROPOSED SOLUTION:\n${solution.trim()}`
+    const ctx = userContent
 
     await Promise.all(
       QDEFS.map(async (q) => {
+        const ac = new AbortController()
+        abortControllersRef.current[q.id] = ac
         try {
-          const text   = await callClaude({ system: buildPrompt(q, n, m, p), userContent: ctx })
+          const text   = await callClaude({ system: buildPrompt(q, n, m, p), userContent: ctx, maxTokens: 2000, signal: ac.signal, quadrantId: q.id })
           const parsed = parseResponse(text)
-          setIterations(prev => ({
-            ...prev,
-            [q.id]: [parsed || { error: true, message: 'Could not parse response.' }],
-          }))
+          if (parsed) {
+            setIterations(prev => ({ ...prev, [q.id]: [parsed] }))
+          } else {
+            // Show snippet of what we got for debugging
+            const snippet = text ? text.slice(0, 200) : '(empty response)'
+            setIterations(prev => ({
+              ...prev,
+              [q.id]: [{ error: true, message: `Could not parse response. Received: ${snippet}...` }],
+            }))
+          }
         } catch (e) {
-          setIterations(prev => ({
-            ...prev,
-            [q.id]: [{ error: true, message: e.message }],
-          }))
+          // Don't report error if aborted
+          if (e.name !== 'AbortError') {
+            setIterations(prev => ({
+              ...prev,
+              [q.id]: [{ error: true, message: e.message }],
+            }))
+          }
+        } finally {
+          delete abortControllersRef.current[q.id]
         }
       })
     )
@@ -127,6 +263,14 @@ export default function App() {
     const lastData = iterations[qId]?.at(-1)
     if (!lastData || lastData.error) return
 
+    // Cancel any existing refine for this quadrant
+    if (abortControllersRef.current[qId]) {
+      abortControllersRef.current[qId].abort()
+    }
+
+    const ac = new AbortController()
+    abortControllersRef.current[qId] = ac
+
     setRefiningQ(prev => ({ ...prev, [qId]: true }))
 
     try {
@@ -138,18 +282,29 @@ export default function App() {
         problem.trim(),
         solution.trim(),
       )
-      const text   = await callClaude({ system, userContent, maxTokens: 1400 })
+      const text   = await callClaude({ system, userContent, maxTokens: 1400, signal: ac.signal, quadrantId: qId })
       const parsed = parseResponse(text)
       if (parsed) {
         setIterations(prev => ({ ...prev, [qId]: [...(prev[qId] || []), parsed] }))
         setNodeFeedback(prev => ({ ...prev, [qId]: {} }))
         setNodeComments(prev => ({ ...prev, [qId]: {} }))
+      } else {
+        setIterations(prev => ({
+          ...prev,
+          [qId]: [...(prev[qId] || []), { error: true, message: 'Could not parse refinement response.' }],
+        }))
       }
     } catch (e) {
-      console.error('Refinement failed:', e)
+      if (e.name !== 'AbortError') {
+        setIterations(prev => ({
+          ...prev,
+          [qId]: [...(prev[qId] || []), { error: true, message: e.message }],
+        }))
+      }
+    } finally {
+      delete abortControllersRef.current[qId]
+      setRefiningQ(prev => ({ ...prev, [qId]: false }))
     }
-
-    setRefiningQ(prev => ({ ...prev, [qId]: false }))
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────
@@ -171,9 +326,56 @@ export default function App() {
   return (
     <div style={{ maxWidth: 960, margin: '0 auto', padding: '32px 20px 60px' }}>
       <header style={{ marginBottom: 28 }}>
-        <h1 style={{ fontSize: 18, fontWeight: 500, marginBottom: 4 }}>
-          Observer — 4-direction analysis
-        </h1>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 4 }}>
+          <h1 style={{ fontSize: 18, fontWeight: 500, margin: 0 }}>
+            Observer — 4-direction analysis
+          </h1>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              onClick={() => setMockMode(m => !m)}
+              style={{
+                fontSize: 11, padding: '4px 10px',
+                border: '0.5px solid var(--color-border)',
+                borderRadius: 4,
+                background: mockMode ? '#22c55e20' : 'var(--color-surface)',
+                cursor: 'pointer',
+                opacity: 0.9,
+                color: mockMode ? '#22c55e' : 'inherit',
+              }}
+              title={mockMode ? 'Mock mode ON' : 'Mock mode OFF'}
+            >
+              {mockMode ? '🧪' : '🌐'}
+            </button>
+            <button
+              onClick={() => setShowApiKeyInput(v => !v)}
+              style={{
+                fontSize: 11, padding: '4px 10px',
+                border: '0.5px solid var(--color-border)',
+                borderRadius: 4,
+                background: 'var(--color-surface)',
+                cursor: 'pointer',
+                opacity: 0.7,
+              }}
+              title="Set OpenRouter API key"
+            >
+              🔑
+            </button>
+            <button
+              onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')}
+              style={{
+                fontSize: 11, padding: '4px 10px',
+                border: '0.5px solid var(--color-border)',
+                borderRadius: 4,
+                background: 'var(--color-surface)',
+                cursor: 'pointer',
+                opacity: 0.7,
+              }}
+              title="Toggle light/dark mode"
+            >
+              {theme === 'light' ? '🌙' : theme === 'dark' ? '☀️' : '◐'}
+            </button>
+          </div>
+        </div>
         <p style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>
           Independent observer across problem clarity, solution fit, blind spots, and alternatives.
         </p>
@@ -215,8 +417,49 @@ export default function App() {
 
         <DepthControls n={n} m={m} p={p} setN={setN} setM={setM} setP={setP} />
 
+        {/* API Key Configuration */}
+        {showApiKeyInput && (
+          <div style={{
+            marginTop: 12,
+            padding: 10,
+            background: 'var(--color-surface)',
+            border: '0.5px solid var(--color-border)',
+            borderRadius: 6,
+          }}>
+            <label htmlFor="api-key" style={{
+              fontSize: 10, color: 'var(--color-text-secondary)',
+              display: 'block', marginBottom: 5,
+              textTransform: 'uppercase', letterSpacing: '0.04em',
+            }}>OpenRouter API Key</label>
+            <input
+              id="api-key"
+              type="password"
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              placeholder="sk-or-v1-..."
+              style={{
+                width: '100%',
+                padding: '6px 10px',
+                fontSize: 12,
+                border: '0.5px solid var(--color-border-strong)',
+                borderRadius: 4,
+                background: 'var(--color-bg)',
+                color: 'var(--color-text-primary)',
+                outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+            <p style={{ fontSize: 10, color: 'var(--color-text-secondary)', marginTop: 6, marginBottom: 0 }}>
+              Get a free key from <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-text-primary)', textDecoration: 'underline' }}>openrouter.ai/keys</a>
+            </p>
+          </div>
+        )}
+
         {error && (
           <p style={{ fontSize: 12, color: '#dc2626', marginTop: 10 }}>{error}</p>
+        )}
+        {tokenWarning && (
+          <p style={{ fontSize: 12, color: '#f59e0b', marginTop: 10 }}>{tokenWarning}</p>
         )}
 
         <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>

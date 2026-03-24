@@ -277,6 +277,7 @@ function CardFooter({
   feedbackGiven, visibleTotal, iterationCount, acceptedCount,
   onConverge, onRefine, accent,
 }) {
+  const hasAnyFeedback = acceptedCount > 0 || correctedCount > 0
   let primary
   if (converged) {
     primary = <span style={{ fontSize: 10, color: '#22c55e' }}>✓ Converged</span>
@@ -290,7 +291,7 @@ function CardFooter({
         Mark converged ✓
       </button>
     )
-  } else if (allFeedbackGiven && correctedCount > 0) {
+  } else if (hasAnyFeedback) {
     primary = (
       <button onClick={onRefine} style={{
         fontSize: 10, padding: '3px 10px',
@@ -512,6 +513,8 @@ export default function QuadrantCard({
           maxWidth: '100%',
           height: canvasH,
           margin: '0 auto',
+          overflow: 'auto',
+          maxHeight: nTop >= 3 || nBot >= 3 ? 520 : 'none',
         }}>
 
           {/* SVG connector lines */}
