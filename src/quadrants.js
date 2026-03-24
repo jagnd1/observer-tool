@@ -82,9 +82,64 @@ Rules:
 }
 
 export function parseResponse(text) {
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) return null
-  try { return JSON.parse(match[0]) } catch { return null }
+  if (!text) return null
+
+  // Try multiple extraction strategies
+  const strategies = [
+    // Strategy 1: Clean markdown code fences (```json ... ``` or ``` ... ```)
+    () => {
+      const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+      if (fenced) return fenced[1].trim()
+      return null
+    },
+    // Strategy 2: Find first complete JSON object using manual brace matching
+    () => {
+      let depth = 0
+      let start = -1
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === '{') {
+          if (depth === 0) start = i
+          depth++
+        } else if (text[i] === '}') {
+          depth--
+          if (depth === 0 && start !== -1) {
+            const candidate = text.slice(start, i + 1)
+            try {
+              const parsed = JSON.parse(candidate)
+              if (parsed && (parsed.core !== undefined || parsed.top || parsed.bottom || parsed.sides)) {
+                return candidate
+              }
+            } catch {
+              // Continue searching for next object
+            }
+          }
+        }
+      }
+      return null
+    },
+    // Strategy 3: Simple regex fallback (original)
+    () => {
+      const match = text.match(/\{[\s\S]*\}/)
+      return match ? match[0] : null
+    },
+  ]
+
+  for (const strategy of strategies) {
+    try {
+      const candidate = strategy()
+      if (candidate) {
+        const parsed = JSON.parse(candidate)
+        // Basic validation: must have core or at least one array
+        if (parsed && (parsed.core !== undefined || Array.isArray(parsed.top) || Array.isArray(parsed.bottom) || Array.isArray(parsed.sides))) {
+          return parsed
+        }
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return null
 }
 
 // ─── Refinement user content ──────────────────────────────────────────────────
